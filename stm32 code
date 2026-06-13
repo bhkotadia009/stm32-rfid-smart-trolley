@@ -1,0 +1,394 @@
+#include "stm32f1xx_hal.h"
+#include "mfrc522.h"
+#include "ssd1306.h"
+#include "fonts.h"
+#include <stdio.h>
+
+/* Handles */
+SPI_HandleTypeDef hspi1;
+I2C_HandleTypeDef hi2c2;
+
+/* FUNCTION DECLARATIONS */
+void SystemClock_Config(void);
+void MX_GPIO_Init(void);
+void MX_SPI1_Init(void);
+void MX_I2C2_Init(void);
+
+void OLED_Off(void);
+void OLED_On(void);
+void RFID_Off(void);
+void RFID_On(void);
+
+void OLED_ShowList(void);
+void OLED_ShowBill(void);
+void OLED_ShowWelcome(void);
+void OLED_ShowThankYou(void);
+
+/* RFID */
+uint8_t status;
+uint8_t str[MAX_LEN];
+
+/* Flags */
+volatile uint8_t scan_mode = 0;
+volatile uint8_t remove_mode = 0;
+volatile uint8_t bill_mode = 0;
+
+/* Timers */
+uint32_t last_activity = 0;
+uint32_t scan_start_time = 0;
+uint32_t bill_time = 0;
+
+/* Data */
+uint8_t kurkure_count = 0;
+uint8_t hide_count = 0;
+uint8_t total_items = 0;
+uint16_t total_price = 0;
+
+char current_item[20] = "None";
+
+/* ================= OLED CONTROL ================= */
+
+void OLED_Off()
+{
+    uint8_t cmd[2] = {0x00, 0xAE};
+    HAL_I2C_Master_Transmit(&hi2c2, 0x3C << 1, cmd, 2, 100);
+}
+
+void OLED_On()
+{
+    uint8_t cmd[2] = {0x00, 0xAF};
+    HAL_I2C_Master_Transmit(&hi2c2, 0x3C << 1, cmd, 2, 100);
+}
+
+/* ================= RFID CONTROL ================= */
+
+void RFID_Off()
+{
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_RESET);
+}
+
+void RFID_On()
+{
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
+    MFRC522_Init();
+}
+
+/* ================= OLED SCREENS ================= */
+
+void OLED_ShowWelcome()
+{
+    ssd1306_Fill(Black);
+
+    ssd1306_SetCursor(10,20);
+    ssd1306_WriteString("Welcome to", Font_7x10, White);
+
+    ssd1306_SetCursor(10,35);
+    ssd1306_WriteString("the Trolley", Font_7x10, White);
+
+    ssd1306_UpdateScreen(&hi2c2);
+
+    HAL_Delay(3000);
+}
+
+void OLED_ShowThankYou()
+{
+    ssd1306_Fill(Black);
+
+    ssd1306_SetCursor(10,25);
+    ssd1306_WriteString("Thank You!", Font_7x10, White);
+
+    ssd1306_SetCursor(0,40);
+    ssd1306_WriteString("Visit Again", Font_7x10, White);
+
+    ssd1306_UpdateScreen(&hi2c2);
+
+    HAL_Delay(3000);
+}
+
+void OLED_ShowList()
+{
+    char buf[32];
+
+    ssd1306_Fill(Black);
+
+    ssd1306_SetCursor(0,0);
+    ssd1306_WriteString("SMART TROLLEY",Font_7x10,White);
+
+    sprintf(buf,"Item:%s",current_item);
+    ssd1306_SetCursor(0,12);
+    ssd1306_WriteString(buf,Font_7x10,White);
+
+    sprintf(buf,"Kurkure:%d",kurkure_count);
+    ssd1306_SetCursor(0,26);
+    ssd1306_WriteString(buf,Font_7x10,White);
+
+    sprintf(buf,"HideSeek:%d",hide_count);
+    ssd1306_SetCursor(0,38);
+    ssd1306_WriteString(buf,Font_7x10,White);
+
+    sprintf(buf,"Items:%d",total_items);
+    ssd1306_SetCursor(0,50);
+    ssd1306_WriteString(buf,Font_7x10,White);
+
+    sprintf(buf,"Rs:%d",total_price);
+    ssd1306_SetCursor(60,50);
+    ssd1306_WriteString(buf,Font_7x10,White);
+
+    ssd1306_UpdateScreen(&hi2c2);
+}
+
+void OLED_ShowBill()
+{
+    char buf[32];
+
+    ssd1306_Fill(Black);
+
+    ssd1306_SetCursor(20,5);
+    ssd1306_WriteString("FINAL BILL", Font_7x10, White);
+
+    sprintf(buf,"Items: %d", total_items);
+    ssd1306_SetCursor(10,25);
+    ssd1306_WriteString(buf, Font_7x10, White);
+
+    sprintf(buf,"Total: Rs %d", total_price);
+    ssd1306_SetCursor(10,40);
+    ssd1306_WriteString(buf, Font_7x10, White);
+
+    ssd1306_UpdateScreen(&hi2c2);
+}
+
+/* ================= MAIN ================= */
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_SPI1_Init();
+    MX_I2C2_Init();
+
+    HAL_GPIO_WritePin(GPIOA,GPIO_PIN_4,GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOA,GPIO_PIN_3,GPIO_PIN_SET);
+
+    ssd1306_Init(&hi2c2);
+    MFRC522_Init();
+
+    OLED_ShowWelcome();   // ✅ Welcome screen
+
+    OLED_ShowList();
+    last_activity = HAL_GetTick();
+
+    while(1)
+    {
+        /* ===== BILL MODE ===== */
+        if(bill_mode)
+        {
+            OLED_ShowBill();
+
+            if(bill_time == 0)
+                bill_time = HAL_GetTick();
+
+            if(HAL_GetTick() - bill_time > 5000)
+            {
+                OLED_ShowThankYou();   // ✅ Thank you screen
+
+                /* RESET */
+                kurkure_count = 0;
+                hide_count = 0;
+                total_items = 0;
+                total_price = 0;
+                sprintf(current_item,"None");
+
+                bill_mode = 0;
+                bill_time = 0;
+
+                OLED_ShowList();
+            }
+
+            continue;
+        }
+
+        /* ===== SCAN MODE ===== */
+        if(scan_mode)
+        {
+            if((HAL_GetTick() - scan_start_time) < 5000)
+            {
+                status = MFRC522_Request(PICC_REQIDL,str);
+
+                if(status == MI_OK)
+                {
+                    status = MFRC522_Anticoll(str);
+
+                    if(status == MI_OK)
+                    {
+                        if(str[0]==0x33 && str[1]==0xB4 && str[2]==0xE3 && str[3]==0x59)
+                        {
+                            if(remove_mode == 0)
+                            {
+                                kurkure_count++;
+                                total_items++;
+                                total_price += 10;
+                                sprintf(current_item,"Kurkure +");
+                            }
+                            else if(kurkure_count > 0)
+                            {
+                                kurkure_count--;
+                                total_items--;
+                                total_price -= 10;
+                                sprintf(current_item,"Kurkure -");
+                            }
+                        }
+                        else if(str[0]==0x13 && str[1]==0x6A && str[2]==0xFA && str[3]==0x29)
+                        {
+                            if(remove_mode == 0)
+                            {
+                                hide_count++;
+                                total_items++;
+                                total_price += 30;
+                                sprintf(current_item,"HideSeek +");
+                            }
+                            else if(hide_count > 0)
+                            {
+                                hide_count--;
+                                total_items--;
+                                total_price -= 30;
+                                sprintf(current_item,"HideSeek -");
+                            }
+                        }
+
+                        OLED_ShowList();
+                        MFRC522_Halt();
+
+                        scan_mode = 0;
+                        remove_mode = 0;
+
+                        last_activity = HAL_GetTick();
+                    }
+                }
+            }
+            else
+            {
+                scan_mode = 0;
+                remove_mode = 0;
+            }
+        }
+
+        HAL_Delay(50);
+    }
+}
+
+/* ================= INTERRUPTS ================= */
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if(GPIO_Pin == GPIO_PIN_0)
+    {
+        scan_mode = 1;
+        remove_mode = 0;
+        scan_start_time = HAL_GetTick();
+        last_activity = HAL_GetTick();
+    }
+    else if(GPIO_Pin == GPIO_PIN_1)
+    {
+        scan_mode = 1;
+        remove_mode = 1;
+        scan_start_time = HAL_GetTick();
+        last_activity = HAL_GetTick();
+    }
+    else if(GPIO_Pin == GPIO_PIN_8)
+    {
+        bill_mode = 1;
+    }
+}
+
+void EXTI0_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
+}
+
+void EXTI1_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_1);
+}
+
+void EXTI9_5_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_8);
+}
+
+/* ================= GPIO ================= */
+
+void MX_GPIO_Init(void)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIO_InitTypeDef GPIO_InitStruct={0};
+
+    /* RFID */
+    GPIO_InitStruct.Pin=GPIO_PIN_4 | GPIO_PIN_3;
+    GPIO_InitStruct.Mode=GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Speed=GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA,&GPIO_InitStruct);
+
+    /* ADD BUTTON */
+    GPIO_InitStruct.Pin=GPIO_PIN_0;
+    GPIO_InitStruct.Mode=GPIO_MODE_IT_FALLING;
+    GPIO_InitStruct.Pull=GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOB,&GPIO_InitStruct);
+
+    /* REMOVE BUTTON */
+    GPIO_InitStruct.Pin=GPIO_PIN_1;
+    HAL_GPIO_Init(GPIOB,&GPIO_InitStruct);
+
+    /* BILL BUTTON (PA8) */
+    GPIO_InitStruct.Pin=GPIO_PIN_8;
+    GPIO_InitStruct.Mode=GPIO_MODE_IT_FALLING;
+    GPIO_InitStruct.Pull=GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOA,&GPIO_InitStruct);
+
+    HAL_NVIC_SetPriority(EXTI0_IRQn,0,0);
+    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+    HAL_NVIC_SetPriority(EXTI1_IRQn,0,0);
+    HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+
+    HAL_NVIC_SetPriority(EXTI9_5_IRQn,0,0);
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+}
+
+/* SPI */
+void MX_SPI1_Init(void)
+{
+    __HAL_RCC_SPI1_CLK_ENABLE();
+
+    hspi1.Instance=SPI1;
+    hspi1.Init.Mode=SPI_MODE_MASTER;
+    hspi1.Init.Direction=SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize=SPI_DATASIZE_8BIT;
+    hspi1.Init.CLKPolarity=SPI_POLARITY_LOW;
+    hspi1.Init.CLKPhase=SPI_PHASE_1EDGE;
+    hspi1.Init.NSS=SPI_NSS_SOFT;
+    hspi1.Init.BaudRatePrescaler=SPI_BAUDRATEPRESCALER_128;
+    hspi1.Init.FirstBit=SPI_FIRSTBIT_MSB;
+
+    HAL_SPI_Init(&hspi1);
+}
+
+/* I2C */
+void MX_I2C2_Init(void)
+{
+    __HAL_RCC_I2C2_CLK_ENABLE();
+
+    hi2c2.Instance=I2C2;
+    hi2c2.Init.ClockSpeed=400000;
+    hi2c2.Init.DutyCycle=I2C_DUTYCYCLE_2;
+    hi2c2.Init.AddressingMode=I2C_ADDRESSINGMODE_7BIT;
+
+    HAL_I2C_Init(&hi2c2);
+}
+
+void SystemClock_Config(void)
+{
+}
